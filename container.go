@@ -91,6 +91,7 @@ type HostConfig struct {
 	ContainerIDFile string
 	LxcConf         []KeyValuePair
 	PortBindings    map[Port][]PortBinding
+	Links           []Link
 }
 
 type BindMap struct {
@@ -176,6 +177,9 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 	var flLxcOpts ListOpts
 	cmd.Var(&flLxcOpts, "lxc-conf", "Add custom lxc options -lxc-conf=\"lxc.cgroup.cpuset.cpus = 0,1\"")
 
+	var flLinks ListOpts
+	cmd.Var(&flLinks, "link", "Add link to another container (containerid:port:alias)")
+
 	if err := cmd.Parse(args); err != nil {
 		return nil, nil, cmd, err
 	}
@@ -254,6 +258,11 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 		}
 	}
 
+	links, err := parseLinks(flLinks)
+	if err != nil {
+		return nil, nil, cmd, err
+	}
+
 	config := &Config{
 		Hostname:        *flHostname,
 		Domainname:      domainname,
@@ -284,6 +293,7 @@ func ParseRun(args []string, capabilities *Capabilities) (*Config, *HostConfig, 
 		ContainerIDFile: *flContainerIDFile,
 		LxcConf:         lxcConf,
 		PortBindings:    portBindings,
+		Links:           links,
 	}
 
 	if capabilities != nil && *flMemory > 0 && !capabilities.SwapLimit {
@@ -609,7 +619,10 @@ func (container *Container) Start(hostConfig *HostConfig) error {
 	container.State.Lock()
 	defer container.State.Unlock()
 
-	if len(hostConfig.Binds) == 0 && len(hostConfig.LxcConf) == 0 && len(hostConfig.PortBindings) == 0 {
+	if len(hostConfig.Binds) == 0 &&
+		len(hostConfig.LxcConf) == 0 &&
+		len(hostConfig.PortBindings) == 0 &&
+		len(hostConfig.Links) == 0 {
 		hostConfig, _ = container.ReadHostConfig()
 	}
 
@@ -787,6 +800,31 @@ func (container *Container) Start(hostConfig *HostConfig) error {
 		"-e", "container=lxc",
 		"-e", "HOSTNAME="+container.Config.Hostname,
 	)
+
+	if hostConfig != nil && hostConfig.Links != nil {
+		runtime := container.runtime
+		for _, l := range hostConfig.Links {
+			linkedContainer := runtime.Get(l.From)
+			if linkedContainer == nil {
+				return fmt.Errorf("Cannot locate container for link: %s AS %s", l.From, l.Alias)
+			}
+			if !linkedContainer.State.Running {
+				return fmt.Errorf("Cannot link a non running container: %s AS %s", l.From, l.Alias)
+			}
+
+			// Check for linkedContainer exposed ports
+			//
+			// Hide ports that are not requested
+
+			l.To = utils.TruncateID(container.ID)
+			l.Addr = fmt.Sprintf("%s:%s", linkedContainer.NetworkSettings.IPAddress, l.Port)
+			if err := runtime.links.RegisterLink(l); err != nil {
+				return nil
+			}
+			params = append(params, "-e", l.ToEnv())
+		}
+	}
+
 	if container.Config.WorkingDir != "" {
 		workingDir := path.Clean(container.Config.WorkingDir)
 		utils.Debugf("[working dir] working dir is %s", workingDir)
